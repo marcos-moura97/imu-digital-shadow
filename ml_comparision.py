@@ -1,6 +1,6 @@
+import argparse
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 import joblib
 from pathlib import Path
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -17,6 +17,7 @@ FS = 50.0
 WINDOW_SIZE = 200
 THRESHOLD = 0.7
 TIME_TOL = 0.03
+PLOTS = True
 
 FEATURES = [
     "acc_x", "acc_y", "acc_z", "acc_smv",
@@ -24,12 +25,23 @@ FEATURES = [
     "ori_azimuth", "ori_pitch", "ori_roll"
 ]
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
-model = tf.keras.models.load_model(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
-Path(OUTPUT_DIR).mkdir(exist_ok=True)
+# Input convention fed to the detector:
+#   "legacy": g, deg/s, orientation = 0   (original behaviour of this script)
+#   "si":     m/s^2, rad/s, orientation = training mean (matches scaler stats)
+INPUT_UNITS = "legacy"
+G = 9.80665
+
+AXIS_FLIP = ""
+
+model = None
+scaler = None
+
+
+def load_model_and_scaler():
+    global model, scaler
+    from mpu_shadow.legacy_model import load_fall_model
+    model = load_fall_model(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
 
 # ============================================================
 # PREPROCESS / INFERENCE
@@ -51,47 +63,50 @@ def prepare_csv(path):
     })
 
     # Match training rate (50 Hz = 20 ms)
-    df = df.resample("20ms").mean().interpolate(method="linear", limit_direction="both")
+    df = df.select_dtypes(include="number").resample("20ms").mean().interpolate(method="linear", limit_direction="both")
 
-    # Training features
+    for ax in AXIS_FLIP:
+        df[f"acc_{ax}"] = -df[f"acc_{ax}"]
+        df[f"gyro_{ax}"] = -df[f"gyro_{ax}"]
+
+    if INPUT_UNITS == "si":
+        df[["acc_x", "acc_y", "acc_z"]] *= G
+        df[["gyro_x", "gyro_y", "gyro_z"]] = np.deg2rad(df[["gyro_x", "gyro_y", "gyro_z"]])
+
     df["acc_smv"] = np.linalg.norm(df[["acc_x", "acc_y", "acc_z"]].values, axis=1)
     df["gyro_smv"] = np.linalg.norm(df[["gyro_x", "gyro_y", "gyro_z"]].values, axis=1)
 
-    # Orientation not present in replay CSVs -> fill with zeros for compatibility
-    df["ori_azimuth"] = 0.0
-    df["ori_pitch"] = 0.0
-    df["ori_roll"] = 0.0
+    # Orientation not present in replay CSVs
+    if INPUT_UNITS == "si":
+        # neutral value for the scaler (=0 after standardisation)
+        for name, mu in zip(FEATURES[8:], scaler.mean_[8:]):
+            df[name] = float(mu)
+    else:
+        df["ori_azimuth"] = 0.0
+        df["ori_pitch"] = 0.0
+        df["ori_roll"] = 0.0
 
     df["timestamp_s"] = df.index.total_seconds()
     return df.reset_index(drop=True)
 
 
-def run_model_on_dataframe(df):
-    buffer = []
-    rows = []
-
-    for _, r in df.iterrows():
-        buffer.append(r[FEATURES].values.astype(np.float32))
-        if len(buffer) > WINDOW_SIZE:
-            buffer.pop(0)
-
-        prob = np.nan
-        detect = 0
-
-        if len(buffer) == WINDOW_SIZE:
-            X = scaler.transform(np.array(buffer))
-            X = np.expand_dims(X, axis=0)
-            pred = model.predict(X, verbose=0)
-            prob = float(np.squeeze(pred))
-            detect = int(prob > THRESHOLD)
-
-        rows.append({
-            "timestamp_s": r["timestamp_s"],
-            "fall_probability": prob,
-            "fall_detected": detect,
-        })
-
-    return pd.DataFrame(rows)
+def run_model_on_dataframe(df, batch_size=512):
+    """Sliding window (stride 1) over the stream; the window ending at sample i
+    gives the prediction for i. Batched, but equivalent to per-sample predict."""
+    X = scaler.transform(df[FEATURES].to_numpy(dtype=np.float32)).astype(np.float32)
+    n = len(X)
+    prob = np.full(n, np.nan)
+    if n >= WINDOW_SIZE:
+        windows = np.lib.stride_tricks.sliding_window_view(X, WINDOW_SIZE, axis=0)
+        windows = np.ascontiguousarray(windows.transpose(0, 2, 1))  # (N, W, F)
+        pred = model.predict(windows, batch_size=batch_size, verbose=0)
+        prob[WINDOW_SIZE - 1:] = np.squeeze(pred, axis=-1)
+    detect = np.where(np.isnan(prob), 0, (prob > THRESHOLD)).astype(int)
+    return pd.DataFrame({
+        "timestamp_s": df["timestamp_s"].to_numpy(),
+        "fall_probability": prob,
+        "fall_detected": detect,
+    })
 
 def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -355,11 +370,28 @@ def run_case(case_name, original_csv, shadowed_csv, labels_csv, output_dir):
 
     # Output
     print_case_summary(summary, has_labels=(y_true is not None))
-    plot_case(merged, case_name, case_dir)
+    if PLOTS:
+        plot_case(merged, case_name, case_dir)
 
     return summary
 
 def main():
+    global MANIFEST_PATH, OUTPUT_DIR, INPUT_UNITS, AXIS_FLIP
+    ap = argparse.ArgumentParser(description="Compare detector output on original vs shadowed IMU data")
+    ap.add_argument("--manifest", default=MANIFEST_PATH)
+    ap.add_argument("--output_dir", default=OUTPUT_DIR)
+    ap.add_argument("--units", choices=["legacy", "si"], default=INPUT_UNITS)
+    ap.add_argument("--axis_flip", default=AXIS_FLIP, help='axes to negate, e.g. "yz" for SisFall')
+    ap.add_argument("--no_plots", action="store_true")
+    args = ap.parse_args()
+    MANIFEST_PATH, OUTPUT_DIR, INPUT_UNITS = args.manifest, args.output_dir, args.units
+    AXIS_FLIP = args.axis_flip
+    if any(c not in "xyz" for c in AXIS_FLIP):
+        raise ValueError("--axis_flip must only contain x, y, z")
+    global PLOTS
+    PLOTS = not args.no_plots
+
+    load_model_and_scaler()
     ensure_dir(OUTPUT_DIR)
 
     manifest = pd.read_csv(MANIFEST_PATH)
